@@ -6,6 +6,8 @@ import time
 import tensorflow as tf
 import tensorflow_hub as hub
 from collections import Counter
+import math # Needed for atan2
+import textwrap # For wrapping long tip text
 
 # --- Load the MoveNet Model ---
 print("Loading MoveNet model...")
@@ -38,948 +40,733 @@ except Exception as e:
     print(f"Warning: pyttsx3 initialization failed: {e}. Audio feedback will be disabled.")
     engine = None
 
-# --- Real-time feedback state ---
+# --- Feedback State ---
 last_feedback_message = ""
 
-# --- Session State and Report Data ---
-current_exercise = "squats"  # Default exercise
-exercise_active = False # To check if user is in frame
+# --- Session State ---
+current_exercise = "squats"
+exercise_active = False
 session_stats = {
-    "squats": {"reps": 0, "feedback": []},
-    "curls": {"reps": 0, "feedback": []},
-    "jacks": {"reps": 0, "feedback": []},
-    "pushups": {"reps": 0, "feedback": []},
-    "lunges": {"reps": 0, "feedback": []},
-    "press": {"reps": 0, "feedback": []},
-    "raises": {"reps": 0, "feedback": []},
-    "goodmornings": {"reps": 0, "feedback": []},
-    "highknees": {"reps": 0, "feedback": []},
+    "squats": {"reps": 0, "feedback": []}, "curls": {"reps": 0, "feedback": []},
+    "jacks": {"reps": 0, "feedback": []}, "pushups": {"reps": 0, "feedback": []},
+    "lunges": {"reps": 0, "feedback": []}, "press": {"reps": 0, "feedback": []},
+    "raises": {"reps": 0, "feedback": []}, "goodmornings": {"reps": 0, "feedback": []},
+    # "highknees": {"reps": 0, "feedback": []}, # Removed High Knees
     "crunches": {"reps": 0, "feedback": []},
 }
 
-# Exercise-specific states
-squat_stage = "up"
-curl_stage = "down"
-jack_stage = "down"
-pushup_stage = "up"
-lunge_stage = "up"
-press_stage = "down"
-raise_stage = "down"
-good_morning_stage = "up"
-high_knee_stage = "down"
-crunch_stage = "down"
+# Exercise Stage Variables (Global Scope)
+exercise_stage = "start" # Generic stage variable for all exercises
+
+# --- Configuration ---
+VISIBILITY_THRESHOLD = 0.2 # Minimum confidence score for a keypoint to be considered reliable
 
 # --- Geometry and Landmark Functions ---
 
 def calculate_angle(a, b, c):
-    """Calculates the angle between three points."""
+    """Calculates the angle (in degrees) between three points a, b, c (b is the vertex)."""
     a = np.array(a); b = np.array(b); c = np.array(c)
-    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
-    angle = np.abs(radians * 180.0 / np.pi)
-    return angle if angle <= 180.0 else 360 - angle
+    # Calculate vectors from the vertex
+    ba = a - b
+    bc = c - b
+    # Calculate angle using atan2 for better stability
+    angle_rad = np.arctan2(bc[1], bc[0]) - np.arctan2(ba[1], ba[0])
+    angle_deg = np.degrees(angle_rad)
+    # Normalize to range [0, 360) then get the smaller angle (<180)
+    angle_final = angle_deg % 360
+    if angle_final > 180:
+        angle_final = 360 - angle_final
+    return angle_final if not np.isnan(angle_final) else 0.0
 
 def get_landmark_px(landmarks, keypoint_name, frame_shape):
-    """Gets the pixel coordinates of a specific landmark."""
-    y, x, _ = frame_shape
-    keypoint = landmarks[KEYPOINT_DICT[keypoint_name]]
-    # Check for valid keypoint data before calculation
-    if keypoint.shape == (3,) and len(keypoint) == 3:
-         return [keypoint[1] * x, keypoint[0] * y]
-    else:
-        # Return a default or raise an error if keypoint data is invalid
-        #print(f"Warning: Invalid landmark data for {keypoint_name}. Landmark: {keypoint}")
-        return [0,0] # Default to origin if invalid data
+    """Gets pixel coordinates [x, y] and confidence of a keypoint."""
+    y_max, x_max, _ = frame_shape
+    idx = KEYPOINT_DICT.get(keypoint_name)
+    if idx is None or landmarks is None or not isinstance(landmarks, np.ndarray) or landmarks.shape != (17, 3) or idx >= 17:
+        return [0, 0], 0.0
+    # Landmarks from MoveNet are [y, x, conf]
+    y, x, conf = landmarks[idx]
+    return [int(x * x_max), int(y * y_max)], float(conf)
 
+# --- RE-ADDED THIS FUNCTION ---
 def get_landmark(landmarks, keypoint_name):
-    """Gets the normalized (0.0-1.0) coordinates of a landmark."""
-    # Check for valid keypoint data before returning
-    keypoint = landmarks[KEYPOINT_DICT[keypoint_name]]
-    if keypoint.shape == (3,) and len(keypoint) == 3:
-        return keypoint
-    else:
-        #print(f"Warning: Invalid landmark data for {keypoint_name}. Landmark: {keypoint}")
+    """Gets the normalized (0.0-1.0) coordinates AND confidence of a landmark."""
+    idx = KEYPOINT_DICT.get(keypoint_name)
+    # Check if keypoint name is valid and landmarks array is usable
+    if idx is None or landmarks is None or not isinstance(landmarks, np.ndarray) or landmarks.shape != (17, 3) or idx >= 17:
+        #print(f"Warning: Invalid keypoint name '{keypoint_name}' or landmarks array.")
         return np.array([0.0, 0.0, 0.0]) # Default if invalid
 
-# --- Feedback Function ---
+    keypoint = landmarks[idx]
+    # Check for valid keypoint data before returning
+    if keypoint.shape == (3,) and len(keypoint) == 3:
+        return keypoint # Returns [y, x, confidence]
+    else:
+        #print(f"Warning: Invalid landmark data format for {keypoint_name}. Shape: {keypoint.shape if isinstance(keypoint, np.ndarray) else 'Not ndarray'}")
+        return np.array([0.0, 0.0, 0.0]) # Default if invalid
+# --- END OF RE-ADDED FUNCTION ---
 
-def say_feedback(text, exercise_name=None, force_say=False): # Added force_say
-    """Says feedback and logs it, prevents spamming the same tip unless forced."""
+# --- Feedback ---
+
+def say_feedback(text, exercise_key=None, force_say=False):
+    """Handles TTS output and logging feedback, preventing repeats unless forced."""
     global last_feedback_message
     if not engine: return
     is_rep_count = text.isdigit()
 
-    # Allow rep counts or new messages, or if forced (for suggestions)
-    if is_rep_count or (text != last_feedback_message) or force_say:
-        if exercise_name and text and not is_rep_count:
-            session_stats[exercise_name]["feedback"].append(text)
-        if not is_rep_count: # Don't overwrite last message with rep counts
-            last_feedback_message = text
-        def run():
-            try: engine.say(text); engine.runAndWait()
-            except Exception: pass
-        threading.Thread(target=run).start()
+    if is_rep_count or force_say or text != last_feedback_message:
+        if exercise_key and text and not is_rep_count and exercise_key in session_stats:
+            session_stats[exercise_key]["feedback"].append(text)
+        if not is_rep_count:
+            last_feedback_message = text # Only update last message for non-rep counts
+
+        # Run TTS in a separate thread to avoid blocking
+        def run_tts():
+            try:
+                engine.say(text)
+                engine.runAndWait()
+            except Exception: pass # Ignore TTS errors
+        # Start thread only if no other TTS thread is running
+        if not any(t.name == 'tts_thread' and t.is_alive() for t in threading.enumerate()):
+            tts_thread = threading.Thread(target=run_tts, name='tts_thread', daemon=True)
+            tts_thread.start()
 
 def reset_feedback_state():
-    """Resets the last feedback message."""
+    """Resets the last feedback message to allow tips again."""
     global last_feedback_message
     last_feedback_message = ""
 
-# --- NEW: Initial Pose Analysis ---
+# --- Drawing ---
 
-def analyze_initial_pose(landmarks):
-    """Analyzes initial landmarks to guess if standing or sitting/lying."""
+def draw_keypoints_and_skeleton(frame, keypoints_with_scores, confidence_threshold):
+    """Draws detected keypoints and skeleton lines."""
+    y_max, x_max, _ = frame.shape
     try:
-        # Get normalized Y coordinates (0.0 = top, 1.0 = bottom)
-        left_hip_y = get_landmark(landmarks, 'left_hip')[0]
-        left_knee_y = get_landmark(landmarks, 'left_knee')[0]
-        left_ankle_y = get_landmark(landmarks, 'left_ankle')[0]
-        left_shoulder_y = get_landmark(landmarks, 'left_shoulder')[0]
+        # Keypoints are already in the correct format [y, x, score] from TF Hub
+        # No need to squeeze if input is already correct shape
+        if keypoints_with_scores is None or keypoints_with_scores.shape != (1, 1, 17, 3):
+             return # Invalid input
 
-        # Basic Standing Check: Hip above knee, knee above ankle, significant distance
-        is_standing = (left_hip_y < left_knee_y - 0.1 and
-                       left_knee_y < left_ankle_y - 0.1)
+        keypoints = np.squeeze(keypoints_with_scores) # Now shape (17, 3)
+        if keypoints.shape != (17, 3): return # Check shape after squeeze
 
-        # Basic Sitting/Lying Check: Hip is near shoulder height or lower than knee
-        is_sitting_lying = (abs(left_hip_y - left_shoulder_y) < 0.15 or
-                            left_hip_y > left_knee_y)
+        # Draw Keypoints
+        for i in range(keypoints.shape[0]):
+            y, x, score = keypoints[i]
+            if score > confidence_threshold:
+                cv2.circle(frame, (int(x * x_max), int(y * y_max)), 4, (0, 255, 0), -1) # Green dots
 
-        if is_standing:
-            return "standing"
-        elif is_sitting_lying:
-            return "sitting_lying"
-        else:
-            return "unknown" # Could be transitioning or bad detection
+        # Draw Skeleton Edges
+        for p1_idx, p2_idx in KEYPOINT_EDGES:
+             # Check indices are within bounds before accessing
+            if 0 <= p1_idx < keypoints.shape[0] and 0 <= p2_idx < keypoints.shape[0]:
+                y1, x1, score1 = keypoints[p1_idx]
+                y2, x2, score2 = keypoints[p2_idx]
+                if score1 > confidence_threshold and score2 > confidence_threshold:
+                    cv2.line(frame, (int(x1 * x_max), int(y1 * y_max)),
+                             (int(x2 * x_max), int(y2 * y_max)), (255, 0, 0), 2) # Blue lines
+            # else: print(f"Warning: Invalid indices in KEYPOINT_EDGES: {p1_idx}, {p2_idx}") # Optional debug
+
     except Exception as e:
-        print(f"Error analyzing initial pose: {e}")
-        return "unknown"
-
-def suggest_exercises(initial_pose_state):
-    """Suggests exercises based on the initial pose."""
-    suggestions = []
-    if initial_pose_state == "standing":
-        suggestions = ["Squats", "Lunges", "Jumping Jacks", "Overhead Press", "High Knees"]
-        suggestion_text = "You seem to be standing. Try Squats, Lunges, or Jumping Jacks."
-    elif initial_pose_state == "sitting_lying":
-        suggestions = ["Pushups", "Crunches", "Bicep Curls"]
-        suggestion_text = "You seem to be sitting or lying down. How about Pushups, Crunches, or Bicep Curls?"
-    else:
-        suggestion_text = "Could not determine starting pose clearly. Starting with Squats."
-
-    print(f"Initial pose detected: {initial_pose_state}")
-    print(f"Suggested exercises: {', '.join(suggestions) if suggestions else 'None'}")
-    say_feedback(suggestion_text, force_say=True) # Force TTS to say suggestion
+        print(f"Error in draw_keypoints_and_skeleton: {e}")
 
 
-# --- Drawing Functions ---
-
-def draw_keypoints_and_skeleton(frame, keypoints, confidence_threshold=0.4):
-    """Draws keypoints and skeleton on the frame."""
-    y, x, _ = frame.shape
-    shaped = np.squeeze(np.multiply(keypoints, [y, x, 1]))
-    if shaped.ndim == 1 or shaped.shape[0] != 17: # Handle case where squeeze might over-reduce or landmarks invalid
-        #print("Warning: Invalid keypoints shape for drawing.")
-        return # Skip drawing if data is bad
-
-    for kp in shaped:
-        # Ensure kp is iterable and has 3 elements
-        if hasattr(kp, '__iter__') and len(kp) == 3:
-            ky, kx, kp_conf = kp
-            if kp_conf > confidence_threshold: cv2.circle(frame, (int(kx), int(ky)), 4, (0, 255, 0), -1)
-        #else: print(f"Warning: Invalid keypoint format: {kp}")
-
-
-    for edge in KEYPOINT_EDGES:
-         # Ensure indices are within bounds
-        if shaped.shape[0] > max(edge):
-            p1_idx, p2_idx = edge
-            # Ensure shape results are valid before accessing
-            if (hasattr(shaped[p1_idx], '__iter__') and len(shaped[p1_idx]) == 3 and
-                hasattr(shaped[p2_idx], '__iter__') and len(shaped[p2_idx]) == 3):
-                y1, x1, c1 = shaped[p1_idx]; y2, x2, c2 = shaped[p2_idx]
-                if c1 > confidence_threshold and c2 > confidence_threshold:
-                    cv2.line(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
-            #else: print(f"Warning: Invalid shape data for edge {edge}")
-        #else: print(f"Warning: Keypoint index out of bounds for edge {edge}")
-
-
-def draw_ui(frame, rep_count, stage, exercise_name): # Removed demo_image argument
-    """Draws the main UI elements on the frame."""
+def draw_ui(frame, rep_count, stage, exercise_name):
+    """Draws the UI elements onto the frame."""
     h, w, _ = frame.shape
-    alpha = 0.6  # Transparency
+    alpha = 0.6
+    try:
+        # Top Bar
+        ui_overlay = frame.copy(); cv2.rectangle(ui_overlay, (0, 0), (w, 100), (20, 20, 20), -1)
+        frame[:] = cv2.addWeighted(ui_overlay, alpha, frame, 1 - alpha, 0)
+        cv2.putText(frame, 'REPS', (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, str(rep_count), (40, 85), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3, cv2.LINE_AA)
+        cv2.putText(frame, 'STAGE', (w - 200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+        stage_str = str(stage).upper() if stage is not None else "N/A"
+        cv2.putText(frame, stage_str, (w - 190, 85), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3, cv2.LINE_AA)
 
-    # --- Top Bar (Reps and Stage) ---
-    ui_overlay = frame.copy()
-    cv2.rectangle(ui_overlay, (0, 0), (w, 100), (20, 20, 20), -1)
-    frame[:] = cv2.addWeighted(ui_overlay, alpha, frame, 1 - alpha, 0)
+        # Bottom Bar
+        bar_h = 130; ui_overlay_bottom = frame.copy()
+        cv2.rectangle(ui_overlay_bottom, (0, h - bar_h), (w, h), (20, 20, 20), -1)
+        frame[:] = cv2.addWeighted(ui_overlay_bottom, alpha, frame, 1 - alpha, 0, frame)
+        cv2.putText(frame, f"EXERCISE: {exercise_name.upper()}", (20, h - 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
+        font_scale, line_h, start_y = 0.5, 20, h - 75
+        # Removed High Knees from controls
+        controls = ["(s) Squats | (c) Curls | (j) Jacks | (p) Pushups | (l) Lunges",
+                    "(o) O.Press | (r) L.Raises | (g) G.Mornings",
+                    "(n) Crunches | (q) Quit Report"] # Removed (h) High Knees
+        for i, line in enumerate(controls):
+            cv2.putText(frame, line, (20, start_y + i * line_h), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
 
-    cv2.putText(frame, 'REPS', (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(frame, str(rep_count), (40, 85), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3, cv2.LINE_AA)
-
-    cv2.putText(frame, 'STAGE', (w - 200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(frame, stage.upper(), (w - 190, 85), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3, cv2.LINE_AA)
-
-    # --- Top-Right Corner Demo Image ---
-    # Removed demo image drawing logic
-
-    # --- Bottom Bar (Controls) ---
-    bottom_bar_height = 130
-    ui_overlay_bottom = frame.copy()
-    cv2.rectangle(ui_overlay_bottom, (0, h - bottom_bar_height), (w, h), (20, 20, 20), -1)
-    frame[:] = cv2.addWeighted(ui_overlay_bottom, alpha, frame, 1 - alpha, 0, frame)
-
-    # Line 1: Current Exercise
-    cv2.putText(frame, f"EXERCISE: {exercise_name.upper()}", (20, h - 100),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA) # Orange color
-
-    # Split controls into multiple lines
-    font_scale = 0.5
-    line_height = 20
-    start_y = h - 75
-
-    controls_line_1 = "(s) Squats | (c) Curls | (j) Jacks | (p) Pushups | (l) Lunges"
-    controls_line_2 = "(o) Overhead Press | (r) Lateral Raises | (g) Good Mornings"
-    controls_line_3 = "(h) High Knees | (n) Crunches | (q) Quit Report"
-
-    cv2.putText(frame, controls_line_1, (20, start_y),
-                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(frame, controls_line_2, (20, start_y + line_height),
-                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(frame, controls_line_3, (20, start_y + (line_height * 2)),
-                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
-
-    if not exercise_active:
-        # Faded overlay if no user is detected
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (frame.shape[1], frame.shape[0]), (0,0,0), -1) # Use -1 for fill
-        frame[:] = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
-
-        # Center text
-        text = "NO USER DETECTED"
-        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)[0]
-        text_x = (frame.shape[1] - text_size[0]) // 2
-        text_y = (frame.shape[0] + text_size[1]) // 2
-        cv2.putText(frame, text, (text_x, text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+        # No User Overlay
+        if not exercise_active:
+            overlay = frame.copy(); cv2.rectangle(overlay, (0, 0), (w, h), (0,0,0), -1)
+            frame[:] = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
+            text = "NO USER DETECTED"; (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
+            cv2.putText(frame, text, ((w - tw) // 2, (h + th) // 2), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+    except Exception as e:
+        print(f"Error drawing UI: {e}")
 
 
-# --- Exercise Processing Functions ---
-# (All process_... functions remain unchanged from previous version)
+# --- NEW Exercise Processing Logic ---
 
-def process_squats(landmarks, frame_shape):
-    """Analyzes squat form and updates state."""
-    global squat_stage
-    rep_count = session_stats["squats"]["reps"]
+def process_exercise(landmarks, frame_shape, exercise_key):
+    """
+    Main dispatcher for exercise processing. Uses simpler state logic.
+    Returns (rep_count, stage)
+    """
+    global exercise_stage # Use the generic stage variable
+
+    rep_count = session_stats[exercise_key]['reps']
+    current_stage = exercise_stage # Start with the current global stage
 
     try:
-        shoulder = get_landmark_px(landmarks, 'left_shoulder', frame_shape)
-        hip = get_landmark_px(landmarks, 'left_hip', frame_shape)
-        knee = get_landmark_px(landmarks, 'left_knee', frame_shape)
-        ankle = get_landmark_px(landmarks, 'left_ankle', frame_shape)
-
-        # Basic visibility check
-        if any(coord == 0 for coord in shoulder + hip + knee + ankle): # Check if any landmark defaulted to [0,0]
-             return rep_count, squat_stage # Skip processing if landmarks are missing
-
-        knee_angle = calculate_angle(hip, knee, ankle)
-        hip_angle = calculate_angle(shoulder, hip, knee)
-
-        if knee_angle < 100 and hip_angle < 100:
-            squat_stage = "down"
-        if knee_angle > 160 and hip_angle > 170 and squat_stage == 'down':
-            squat_stage = "up"
-            rep_count += 1
-            session_stats["squats"]["reps"] = rep_count
-            print(f"Squat Count: {rep_count}")
-            say_feedback(str(rep_count))
-            reset_feedback_state() # Reset for next rep
-
-        if squat_stage == 'down':
-            if knee_angle > 100:
-                say_feedback("Go lower for a full squat", "squats")
-            elif hip_angle < 80:
-                say_feedback("Keep your chest up", "squats")
-
-        return rep_count, squat_stage
-
-    except Exception:
-        # print(f"Error processing squats: {e}") # Optional debug
-        return rep_count, squat_stage
-
-def process_curls(landmarks, frame_shape):
-    """Analyzes bicep curl form (left arm) and updates state."""
-    global curl_stage
-    rep_count = session_stats["curls"]["reps"]
-
-    try:
-        shoulder = get_landmark_px(landmarks, 'left_shoulder', frame_shape)
-        elbow = get_landmark_px(landmarks, 'left_elbow', frame_shape)
-        wrist = get_landmark_px(landmarks, 'left_wrist', frame_shape)
-
-        if any(coord == 0 for coord in shoulder + elbow + wrist):
-             return rep_count, curl_stage
-
-        elbow_angle = calculate_angle(shoulder, elbow, wrist)
-
-        if elbow_angle < 50:
-            curl_stage = "up"
-        if elbow_angle > 160 and curl_stage == 'up':
-            curl_stage = "down"
-            rep_count += 1
-            session_stats["curls"]["reps"] = rep_count
-            print(f"Curl Count: {rep_count}")
-            say_feedback(str(rep_count))
-            reset_feedback_state() # Reset for next rep
-
-        if curl_stage == 'up' and elbow_angle > 50:
-            say_feedback("Bring your arm all the way up", "curls")
-        elif curl_stage == 'down' and elbow_angle < 160:
-            say_feedback("Straighten your arm fully", "curls")
-
-        return rep_count, curl_stage
-
-    except Exception:
-        # print(f"Error processing curls: {e}")
-        return rep_count, curl_stage
-
-def process_jacks(landmarks, frame_shape):
-    """Analyzes jumping jack form and updates state."""
-    global jack_stage
-    rep_count = session_stats["jacks"]["reps"]
-
-    try:
-        l_shoulder = get_landmark_px(landmarks, 'left_shoulder', frame_shape)
-        r_shoulder = get_landmark_px(landmarks, 'right_shoulder', frame_shape)
-        l_wrist = get_landmark_px(landmarks, 'left_wrist', frame_shape)
-        r_wrist = get_landmark_px(landmarks, 'right_wrist', frame_shape)
-        l_ankle = get_landmark_px(landmarks, 'left_ankle', frame_shape)
-        r_ankle = get_landmark_px(landmarks, 'right_ankle', frame_shape)
-
-        if any(coord == 0 for coord in l_shoulder + r_shoulder + l_wrist + r_wrist + l_ankle + r_ankle):
-            return rep_count, jack_stage
-
-        shoulder_width = abs(l_shoulder[0] - r_shoulder[0])
-        leg_distance = abs(l_ankle[0] - r_ankle[0])
-        # Check if wrists are physically above shoulders (Y coordinate is smaller)
-        arms_up = (l_wrist[1] < l_shoulder[1] and r_wrist[1] < r_shoulder[1])
-
-        # State definitions
-        is_down = leg_distance < shoulder_width * 1.2 and not arms_up
-        is_up = leg_distance > shoulder_width * 1.5 and arms_up
-
-        if is_up:
-            jack_stage = "up"
-        if is_down and jack_stage == 'up':
-            jack_stage = "down"
-            rep_count += 1
-            session_stats["jacks"]["reps"] = rep_count
-            print(f"Jack Count: {rep_count}")
-            say_feedback(str(rep_count))
-            reset_feedback_state() # Reset for next rep
-
-        # Feedback conditions
-        if jack_stage == 'up':
-            if not arms_up:
-                say_feedback("Bring your arms all the way up", "jacks")
-            if leg_distance < shoulder_width * 1.5:
-                say_feedback("Spread your legs wider", "jacks")
-
-        return rep_count, jack_stage
-
-    except Exception:
-        # print(f"Error processing jacks: {e}")
-        return rep_count, jack_stage
-
-def process_pushups(landmarks, frame_shape):
-    """Analyzes push-up form (side view) and updates state."""
-    global pushup_stage
-    rep_count = session_stats["pushups"]["reps"]
-
-    try:
-        # Assuming a side view, tracks left side
-        shoulder = get_landmark_px(landmarks, 'left_shoulder', frame_shape)
-        elbow = get_landmark_px(landmarks, 'left_elbow', frame_shape)
-        wrist = get_landmark_px(landmarks, 'left_wrist', frame_shape)
-        hip = get_landmark_px(landmarks, 'left_hip', frame_shape)
-        knee = get_landmark_px(landmarks, 'left_knee', frame_shape)
-
-        if any(coord == 0 for coord in shoulder + elbow + wrist + hip + knee):
-             return rep_count, pushup_stage
-
-        elbow_angle = calculate_angle(shoulder, elbow, wrist)
-        body_angle = calculate_angle(shoulder, hip, knee) # Angle to check for straight back
-
-        if elbow_angle < 90:
-            pushup_stage = "down"
-        if elbow_angle > 160 and pushup_stage == 'down':
-            pushup_stage = "up"
-            rep_count += 1
-            session_stats["pushups"]["reps"] = rep_count
-            print(f"Pushup Count: {rep_count}")
-            say_feedback(str(rep_count))
-            reset_feedback_state() # Reset for next rep
-
-        if body_angle < 160:
-            say_feedback("Keep your back straight", "pushups")
-        if pushup_stage == 'down' and elbow_angle > 90:
-            say_feedback("Go lower for a full push-up", "pushups")
-
-        return rep_count, pushup_stage
-
-    except Exception:
-        # print(f"Error processing pushups: {e}")
-        return rep_count, pushup_stage
-
-def process_lunges(landmarks, frame_shape):
-    """Analyzes lunge form (left leg forward) and updates state."""
-    global lunge_stage
-    rep_count = session_stats["lunges"]["reps"]
-
-    try:
-        # Tracks left leg as the forward leg
-        l_hip = get_landmark_px(landmarks, 'left_hip', frame_shape)
-        l_knee = get_landmark_px(landmarks, 'left_knee', frame_shape)
-        l_ankle = get_landmark_px(landmarks, 'left_ankle', frame_shape)
-
-        r_hip = get_landmark_px(landmarks, 'right_hip', frame_shape)
-        r_knee = get_landmark_px(landmarks, 'right_knee', frame_shape)
-        # Use a more stable point like hip for the back angle reference if ankle is unstable
-        r_ankle = get_landmark_px(landmarks, 'right_ankle', frame_shape)
-
-        if any(coord == 0 for coord in l_hip + l_knee + l_ankle + r_hip + r_knee + r_ankle):
-             return rep_count, lunge_stage
-
-
-        front_knee_angle = calculate_angle(l_hip, l_knee, l_ankle)
-        # Angle of back leg thigh relative to torso (approx)
-        back_thigh_angle = calculate_angle(r_knee, r_hip, l_hip) # Angle at right hip
-
-        # Check vertical alignment for back knee (approximate)
-        #back_knee_low_enough = r_knee[1] > (frame_shape[0] * 0.7) # Adjust threshold as needed
-
-        is_down = front_knee_angle < 110 and back_thigh_angle > 80 # Back thigh more vertical
-        is_up = front_knee_angle > 160 and back_thigh_angle < 70 # Back thigh more horizontal
-
-        if is_down:
-            lunge_stage = "down"
-        if is_up and lunge_stage == 'down':
-            lunge_stage = "up"
-            rep_count += 1
-            session_stats["lunges"]["reps"] = rep_count
-            print(f"Lunge Count: {rep_count}")
-            say_feedback(str(rep_count))
-            reset_feedback_state() # Reset for next rep
-
-        if lunge_stage == 'down':
-            if front_knee_angle > 110:
-                say_feedback("Lower your body", "lunges")
-            # Check if front knee's X is significantly ahead of ankle's X
-            if (l_knee[0] - l_ankle[0]) > 50: # Adjust threshold pixel value as needed
-                say_feedback("Keep front knee behind toe", "lunges")
-
-        return rep_count, lunge_stage
-
-    except Exception:
-        # print(f"Error processing lunges: {e}")
-        return rep_count, lunge_stage
-
-def process_overhead_press(landmarks, frame_shape):
-    """Analyzes overhead press form and updates state."""
-    global press_stage
-    rep_count = session_stats["press"]["reps"]
-
-    try:
-        # Tracks both arms
-        l_shoulder = get_landmark_px(landmarks, 'left_shoulder', frame_shape)
-        l_elbow = get_landmark_px(landmarks, 'left_elbow', frame_shape)
-        l_wrist = get_landmark_px(landmarks, 'left_wrist', frame_shape)
-
-        r_shoulder = get_landmark_px(landmarks, 'right_shoulder', frame_shape)
-        r_elbow = get_landmark_px(landmarks, 'right_elbow', frame_shape)
-        r_wrist = get_landmark_px(landmarks, 'right_wrist', frame_shape)
-
-        if any(coord == 0 for coord in l_shoulder + l_elbow + l_wrist + r_shoulder + r_elbow + r_wrist):
-             return rep_count, press_stage
-
-
-        l_elbow_angle = calculate_angle(l_shoulder, l_elbow, l_wrist)
-        r_elbow_angle = calculate_angle(r_shoulder, r_elbow, r_wrist)
-
-        # Arms are up if wrists are above shoulders and elbows are straight
-        arms_up = (l_wrist[1] < l_shoulder[1] and r_wrist[1] < r_shoulder[1] and
-                   l_elbow_angle > 160 and r_elbow_angle > 160)
-        # Arms are down if wrists are near shoulders and elbows are bent
-        arms_down = (l_wrist[1] > l_shoulder[1] - 30 and r_wrist[1] > r_shoulder[1] - 30 and # Allow slightly above
-                     l_elbow_angle < 100 and r_elbow_angle < 100)
-
-        if arms_up:
-            press_stage = "up"
-        if arms_down and press_stage == 'up':
-            press_stage = "down"
-            rep_count += 1
-            session_stats["press"]["reps"] = rep_count
-            print(f"Press Count: {rep_count}")
-            say_feedback(str(rep_count))
-            reset_feedback_state() # Reset for next rep
-
-        if press_stage == 'up' and (l_elbow_angle < 160 or r_elbow_angle < 160):
-            say_feedback("Extend your arms fully", "press")
-        elif press_stage == 'down' and (l_elbow_angle > 100 or r_elbow_angle > 100):
-             # Only give feedback if arms aren't fully down yet during the down phase
-             if l_wrist[1] > l_shoulder[1] or r_wrist[1] > r_shoulder[1]:
-                say_feedback("Lower arms to shoulders", "press")
-
-
-        return rep_count, press_stage
-
-    except Exception:
-        # print(f"Error processing press: {e}")
-        return rep_count, press_stage
-
-def process_lateral_raises(landmarks, frame_shape):
-    """Analyzes lateral raise form and updates state."""
-    global raise_stage
-    rep_count = session_stats["raises"]["reps"]
-
-    try:
-        l_shoulder = get_landmark_px(landmarks, 'left_shoulder', frame_shape)
-        l_elbow = get_landmark_px(landmarks, 'left_elbow', frame_shape)
-        l_wrist = get_landmark_px(landmarks, 'left_wrist', frame_shape)
-        l_hip = get_landmark_px(landmarks, 'left_hip', frame_shape)
-
-        r_shoulder = get_landmark_px(landmarks, 'right_shoulder', frame_shape)
-        r_elbow = get_landmark_px(landmarks, 'right_elbow', frame_shape)
-        r_wrist = get_landmark_px(landmarks, 'right_wrist', frame_shape)
-        r_hip = get_landmark_px(landmarks, 'right_hip', frame_shape)
-
-        if any(coord == 0 for coord in l_shoulder + l_elbow + l_wrist + l_hip +
-                                        r_shoulder + r_elbow + r_wrist + r_hip):
-             return rep_count, raise_stage
-
-        # Angle at the shoulder (armpit) - Use hip as stable anchor
-        l_shoulder_angle = calculate_angle(l_hip, l_shoulder, l_elbow)
-        r_shoulder_angle = calculate_angle(r_hip, r_shoulder, r_elbow)
-        # Angle at the elbow (to check for straight arms)
-        l_elbow_angle = calculate_angle(l_shoulder, l_elbow, l_wrist)
-        r_elbow_angle = calculate_angle(r_shoulder, r_elbow, r_wrist)
-
-        # Arms are up if raised roughly parallel to the ground (angle ~90)
-        arms_up = l_shoulder_angle > 75 and r_shoulder_angle > 75
-        # Arms are down if close to the body
-        arms_down = l_shoulder_angle < 30 and r_shoulder_angle < 30
-
-        if arms_up:
-            raise_stage = "up"
-        if arms_down and raise_stage == 'up':
-            raise_stage = "down"
-            rep_count += 1
-            session_stats["raises"]["reps"] = rep_count
-            print(f"Raise Count: {rep_count}")
-            say_feedback(str(rep_count))
-            reset_feedback_state() # Reset for next rep
-
-        if raise_stage == 'up':
-            if l_elbow_angle < 150 or r_elbow_angle < 150:
-                say_feedback("Keep your arms straighter", "raises")
-            # Check if wrists go significantly above shoulders
-            if l_wrist[1] < l_shoulder[1] - 30 or r_wrist[1] < r_shoulder[1] - 30: # 30px tolerance
-                say_feedback("Don't raise above shoulder height", "raises")
-            if l_shoulder_angle < 75 or r_shoulder_angle < 75:
-                 say_feedback("Raise arms parallel to floor", "raises")
-
-
-        return rep_count, raise_stage
-
-    except Exception:
-        # print(f"Error processing raises: {e}")
-        return rep_count, raise_stage
-
-def process_good_mornings(landmarks, frame_shape):
-    """Analyzes 'Good Morning' (hip hinge) form and updates state."""
-    global good_morning_stage
-    rep_count = session_stats["goodmornings"]["reps"]
-
-    try:
-        # Tracks left side
-        shoulder = get_landmark_px(landmarks, 'left_shoulder', frame_shape)
-        hip = get_landmark_px(landmarks, 'left_hip', frame_shape)
-        knee = get_landmark_px(landmarks, 'left_knee', frame_shape)
-        ankle = get_landmark_px(landmarks, 'left_ankle', frame_shape)
-
-        if any(coord == 0 for coord in shoulder + hip + knee + ankle):
-             return rep_count, good_morning_stage
-
-        hip_angle = calculate_angle(shoulder, hip, knee)
-        knee_angle = calculate_angle(hip, knee, ankle)
-
-        is_down = hip_angle < 110 # Allow slightly more bend than before
-        is_up = hip_angle > 165 # Slightly less than fully straight
-
-        if is_down:
-            good_morning_stage = "down"
-        if is_up and good_morning_stage == 'down':
-            good_morning_stage = "up"
-            rep_count += 1
-            session_stats["goodmornings"]["reps"] = rep_count
-            print(f"Good Morning Count: {rep_count}")
-            say_feedback(str(rep_count))
-            reset_feedback_state() # Reset for next rep
-
-        if knee_angle < 150:
-            say_feedback("Keep legs straighter, bend at hips", "goodmornings")
-        if good_morning_stage == 'down' and hip_angle > 110:
-            say_feedback("Hinge lower from your hips", "goodmornings")
-
-        return rep_count, good_morning_stage
-
-    except Exception:
-        # print(f"Error processing good mornings: {e}")
-        return rep_count, good_morning_stage
-
-def process_high_knees(landmarks, frame_shape):
-    """Analyzes high knees form and updates state."""
-    global high_knee_stage
-    rep_count = session_stats["highknees"]["reps"]
-
-    try:
-        # Get normalized Y coordinates (0.0 at top, 1.0 at bottom)
-        l_knee_y = get_landmark(landmarks, 'left_knee')[0]
-        l_hip_y = get_landmark(landmarks, 'left_hip')[0]
-        r_knee_y = get_landmark(landmarks, 'right_knee')[0]
-        r_hip_y = get_landmark(landmarks, 'right_hip')[0]
-
-        # Check confidence scores
-        l_knee_conf = get_landmark(landmarks, 'left_knee')[2]
-        l_hip_conf = get_landmark(landmarks, 'left_hip')[2]
-        r_knee_conf = get_landmark(landmarks, 'right_knee')[2]
-        r_hip_conf = get_landmark(landmarks, 'right_hip')[2]
-
-        # Only process if key landmarks are visible
-        if min(l_knee_conf, l_hip_conf, r_knee_conf, r_hip_conf) < 0.3:
-            return rep_count, high_knee_stage
-
-        # Knee is 'up' if its Y coord is less than (higher than) the hip's Y coord
-        # Add a threshold to avoid minor movements counting
-        knee_threshold = 0.05
-        left_knee_up = l_knee_y < (l_hip_y - knee_threshold)
-        right_knee_up = r_knee_y < (r_hip_y - knee_threshold)
-
-        if high_knee_stage == 'down' and (left_knee_up or right_knee_up):
-            high_knee_stage = 'up' # One knee is up
-            if left_knee_up:
-                if l_knee_y > (l_hip_y - 0.1): # Check if knee is *barely* above hip
-                     say_feedback("Lift left knee higher", "highknees")
-            elif right_knee_up:
-                if r_knee_y > (r_hip_y - 0.1):
-                     say_feedback("Lift right knee higher", "highknees")
-
-        elif high_knee_stage == 'up' and not left_knee_up and not right_knee_up:
-            high_knee_stage = 'down' # Both knees are down
-            rep_count += 1 # Count one rep after one cycle (e.g., left up, then down)
-            session_stats["highknees"]["reps"] = rep_count
-            print(f"High Knee Count: {rep_count}")
-            say_feedback(str(rep_count))
-            reset_feedback_state() # Reset for next rep
-
-        return rep_count, high_knee_stage
-
-    except Exception:
-        # print(f"Error processing high knees: {e}")
-        return rep_count, high_knee_stage
-
-def process_crunches(landmarks, frame_shape):
-    """Analyzes crunch form (side view) and updates state."""
-    global crunch_stage
-    rep_count = session_stats["crunches"]["reps"]
-
-    try:
-        # Assuming side view, tracks left side
-        shoulder = get_landmark_px(landmarks, 'left_shoulder', frame_shape)
-        hip = get_landmark_px(landmarks, 'left_hip', frame_shape)
-        knee = get_landmark_px(landmarks, 'left_knee', frame_shape)
-
-        if any(coord == 0 for coord in shoulder + hip + knee):
-             return rep_count, crunch_stage
-
-        # Angle at the hip. Crunched = smaller angle.
-        hip_angle = calculate_angle(shoulder, hip, knee)
-
-        is_down = hip_angle > 115 # Lying relatively flat
-        is_up = hip_angle < 100 # Crunched up
-
-        if is_up:
-            crunch_stage = "up"
-        if is_down and crunch_stage == 'up':
-            crunch_stage = "down"
-            rep_count += 1
-            session_stats["crunches"]["reps"] = rep_count
-            print(f"Crunch Count: {rep_count}")
-            say_feedback(str(rep_count))
-            reset_feedback_state() # Reset for next rep
-
-        if crunch_stage == 'up' and hip_angle > 100:
-             # Only give feedback if not fully crunched
-             say_feedback("Lift shoulders higher", "crunches")
-
-
-        return rep_count, crunch_stage
-
-    except Exception:
-        # print(f"Error processing crunches: {e}")
-        return rep_count, crunch_stage
+        # Get coordinates and confidences, check visibility early
+        coords = {}
+        confs = {}
+        required_joints = []
+
+        # Define required joints (same as before, excluding highknees)
+        if exercise_key == "squats": required_joints = ['left_shoulder', 'left_hip', 'left_knee', 'left_ankle']
+        elif exercise_key == "curls": required_joints = ['left_shoulder', 'left_elbow', 'left_wrist']
+        elif exercise_key == "jacks": required_joints = ['left_shoulder', 'right_shoulder', 'left_wrist', 'right_wrist', 'left_ankle', 'right_ankle', 'left_hip', 'right_hip']
+        elif exercise_key == "pushups": required_joints = ['left_shoulder', 'left_elbow', 'left_wrist', 'left_hip', 'left_knee']
+        elif exercise_key == "lunges": required_joints = ['left_hip', 'left_knee', 'left_ankle', 'right_hip', 'right_knee', 'right_ankle']
+        elif exercise_key == "press": required_joints = ['left_shoulder', 'left_elbow', 'left_wrist', 'right_shoulder', 'right_elbow', 'right_wrist']
+        elif exercise_key == "raises": required_joints = ['left_shoulder', 'left_elbow', 'left_wrist', 'left_hip', 'right_shoulder', 'right_elbow', 'right_wrist', 'right_hip']
+        elif exercise_key == "goodmornings": required_joints = ['left_shoulder', 'left_hip', 'left_knee', 'left_ankle']
+        # Removed highknees case
+        elif exercise_key == "crunches": required_joints = ['left_shoulder', 'left_hip', 'left_knee']
+
+        all_visible = True
+        for joint in required_joints:
+            coords[joint], confs[joint] = get_landmark_px(landmarks, joint, frame_shape)
+            if confs[joint] < VISIBILITY_THRESHOLD:
+                all_visible = False
+                break
+
+        if not all_visible:
+            return rep_count, "N/A" # Return N/A immediately if not visible
+
+        # --- Exercise Specific Logic with Hysteresis ---
+        # State: "start" -> "down" -> "up" -> "down" (counts rep on up->down or down->up depending on exercise)
+
+        # Bicep Curl (Left Arm)
+        if exercise_key == "curls":
+            angle = calculate_angle(coords['left_shoulder'], coords['left_elbow'], coords['left_wrist'])
+            UP_THRESH = 70    # Angle clearly below this is 'up'
+            DOWN_THRESH = 140 # Angle clearly above this is 'down'
+
+            if angle < UP_THRESH and exercise_stage != "up":
+                current_stage = "up"
+            elif angle > DOWN_THRESH and exercise_stage == "up": # Count rep on transition from UP to DOWN
+                current_stage = "down"
+                rep_count += 1
+                session_stats[exercise_key]['reps'] = rep_count
+                print(f"Curl Count: {rep_count}"); say_feedback(str(rep_count)); reset_feedback_state()
+            # else: keep current_stage = exercise_stage (hysteresis)
+
+            # Feedback
+            if current_stage == 'up' and angle > UP_THRESH + 15: say_feedback("Curl higher", exercise_key)
+            elif current_stage == 'down' and angle < DOWN_THRESH - 15: say_feedback("Extend arm", exercise_key)
+
+        # Squat
+        elif exercise_key == "squats":
+            knee_angle = calculate_angle(coords['left_hip'], coords['left_knee'], coords['left_ankle'])
+            hip_angle = calculate_angle(coords['left_shoulder'], coords['left_hip'], coords['left_knee'])
+            DOWN_KNEE_THRESH, DOWN_HIP_THRESH = 110, 100
+            UP_KNEE_THRESH, UP_HIP_THRESH = 150, 160
+
+            if knee_angle < DOWN_KNEE_THRESH and hip_angle < DOWN_HIP_THRESH and exercise_stage != "down":
+                current_stage = "down"
+            elif knee_angle > UP_KNEE_THRESH and hip_angle > UP_HIP_THRESH and exercise_stage == "down": # Count on DOWN to UP
+                current_stage = "up"
+                rep_count += 1; session_stats[exercise_key]['reps'] = rep_count
+                print(f"Squat Count: {rep_count}"); say_feedback(str(rep_count)); reset_feedback_state()
+            # else: keep current_stage = exercise_stage
+
+            # Feedback
+            if current_stage == 'down':
+                if knee_angle > DOWN_KNEE_THRESH + 10 or hip_angle > DOWN_HIP_THRESH + 10: say_feedback("Go lower", exercise_key)
+                elif hip_angle < 70: say_feedback("Keep chest up", exercise_key)
+
+        # Lateral Raises (Shoulder Abduction Angle)
+        elif exercise_key == "raises":
+            l_sh_angle = calculate_angle(coords['left_hip'], coords['left_shoulder'], coords['left_elbow'])
+            r_sh_angle = calculate_angle(coords['right_hip'], coords['right_shoulder'], coords['right_elbow'])
+            l_el_angle = calculate_angle(coords['left_shoulder'], coords['left_elbow'], coords['left_wrist'])
+            r_el_angle = calculate_angle(coords['right_shoulder'], coords['right_elbow'], coords['right_wrist'])
+            UP_SHOULDER_THRESH, DOWN_SHOULDER_THRESH = 70, 30
+            STRAIGHT_ELBOW_THRESH = 130
+
+            arms_straight = l_el_angle > STRAIGHT_ELBOW_THRESH and r_el_angle > STRAIGHT_ELBOW_THRESH
+            shoulders_up = l_sh_angle > UP_SHOULDER_THRESH and r_sh_angle > UP_SHOULDER_THRESH
+            shoulders_down = l_sh_angle < DOWN_SHOULDER_THRESH and r_sh_angle < DOWN_SHOULDER_THRESH
+
+            if shoulders_up and arms_straight and exercise_stage != "up":
+                current_stage = "up"
+            elif shoulders_down and exercise_stage == "up": # Count on UP to DOWN
+                current_stage = "down"
+                rep_count += 1; session_stats[exercise_key]['reps'] = rep_count
+                print(f"Raise Count: {rep_count}"); say_feedback(str(rep_count)); reset_feedback_state()
+            # else: keep current_stage = exercise_stage
+
+            # Feedback
+            if current_stage == 'up':
+                if not arms_straight: say_feedback("Straighter arms", exercise_key)
+                nose_coord, _ = get_landmark_px(landmarks, 'nose', frame_shape)
+                # Check if wrist Y is above nose Y (adjust threshold as needed)
+                if coords['left_wrist'][1] < nose_coord[1] - 30 or coords['right_wrist'][1] < nose_coord[1] - 30:
+                     say_feedback("Don't raise too high", exercise_key)
+                elif l_sh_angle < UP_SHOULDER_THRESH - 5 or r_sh_angle < UP_SHOULDER_THRESH - 5: # If arms dropped slightly
+                     say_feedback("Lift arms higher", exercise_key)
+
+        # Pushups
+        elif exercise_key == "pushups":
+            elbow_angle = calculate_angle(coords['left_shoulder'], coords['left_elbow'], coords['left_wrist'])
+            body_angle = calculate_angle(coords['left_shoulder'], coords['left_hip'], coords['left_knee'])
+            DOWN_ELBOW_THRESH, UP_ELBOW_THRESH = 100, 150
+            STRAIGHT_BODY_THRESH = 150
+
+            if elbow_angle < DOWN_ELBOW_THRESH and exercise_stage != "down":
+                current_stage = "down"
+            elif elbow_angle > UP_ELBOW_THRESH and exercise_stage == "down": # Count on DOWN to UP
+                 current_stage = "up"
+                 rep_count += 1; session_stats[exercise_key]['reps'] = rep_count
+                 print(f"Pushup Count: {rep_count}"); say_feedback(str(rep_count)); reset_feedback_state()
+            # else: keep current_stage = exercise_stage
+
+            if body_angle < STRAIGHT_BODY_THRESH: say_feedback("Keep back straight", exercise_key)
+            if current_stage == 'down' and elbow_angle > DOWN_ELBOW_THRESH + 10: say_feedback("Go lower", exercise_key)
+
+        # Lunges
+        elif exercise_key == "lunges":
+            front_knee_angle = calculate_angle(coords['left_hip'], coords['left_knee'], coords['left_ankle'])
+            back_knee_angle = calculate_angle(coords['right_hip'], coords['right_knee'], coords['right_ankle'])
+            DOWN_FRONT_KNEE_THRESH, DOWN_BACK_KNEE_THRESH = 120, 130
+            UP_FRONT_KNEE_THRESH, UP_BACK_KNEE_THRESH = 160, 150
+
+            if front_knee_angle < DOWN_FRONT_KNEE_THRESH and back_knee_angle < DOWN_BACK_KNEE_THRESH and exercise_stage != "down":
+                current_stage = "down"
+            elif front_knee_angle > UP_FRONT_KNEE_THRESH and back_knee_angle > UP_BACK_KNEE_THRESH and exercise_stage == "down": # Count on DOWN to UP
+                 current_stage = "up"
+                 rep_count += 1; session_stats[exercise_key]['reps'] = rep_count
+                 print(f"Lunge Count: {rep_count}"); say_feedback(str(rep_count)); reset_feedback_state()
+            # else: keep current_stage = exercise_stage
+
+            if current_stage == 'down':
+                 if front_knee_angle > DOWN_FRONT_KNEE_THRESH + 10 or back_knee_angle > DOWN_BACK_KNEE_THRESH + 10: say_feedback("Lower body", exercise_key)
+                 if coords['left_knee'][0] > coords['left_ankle'][0] + 30: say_feedback("Knee over ankle", exercise_key)
+
+        # Overhead Press
+        elif exercise_key == "press":
+            l_el_angle = calculate_angle(coords['left_shoulder'], coords['left_elbow'], coords['left_wrist'])
+            r_el_angle = calculate_angle(coords['right_shoulder'], coords['right_elbow'], coords['right_wrist'])
+            UP_ELBOW_THRESH, DOWN_ELBOW_THRESH = 150, 100
+            wrists_above_shoulders = coords['left_wrist'][1] < coords['left_shoulder'][1] - 10 and coords['right_wrist'][1] < coords['right_shoulder'][1] - 10
+            wrists_at_shoulders = abs(coords['left_wrist'][1] - coords['left_shoulder'][1]) < 40 and abs(coords['right_wrist'][1] - coords['right_shoulder'][1]) < 40
+
+            if wrists_above_shoulders and l_el_angle > UP_ELBOW_THRESH and r_el_angle > UP_ELBOW_THRESH and exercise_stage != "up":
+                 current_stage = "up"
+            elif wrists_at_shoulders and l_el_angle < DOWN_ELBOW_THRESH and r_el_angle < DOWN_ELBOW_THRESH and exercise_stage == "up": # Count on UP to DOWN
+                 current_stage = "down"
+                 rep_count += 1; session_stats[exercise_key]['reps'] = rep_count
+                 print(f"Press Count: {rep_count}"); say_feedback(str(rep_count)); reset_feedback_state()
+            # else: keep current_stage = exercise_stage
+
+            if current_stage == 'up' and (l_el_angle < UP_ELBOW_THRESH - 5 or r_el_angle < UP_ELBOW_THRESH - 5): say_feedback("Extend arms", exercise_key)
+            elif current_stage == 'down' and not wrists_at_shoulders: say_feedback("Lower to shoulders", exercise_key)
+
+        # Good Mornings
+        elif exercise_key == "goodmornings":
+             hip_angle = calculate_angle(coords['left_shoulder'], coords['left_hip'], coords['left_knee'])
+             knee_angle = calculate_angle(coords['left_hip'], coords['left_knee'], coords['left_ankle'])
+             DOWN_HIP_THRESH, UP_HIP_THRESH = 130, 160
+             STRAIGHT_KNEE_THRESH = 150
+
+             if hip_angle < DOWN_HIP_THRESH and exercise_stage != "down":
+                  current_stage = "down"
+             elif hip_angle > UP_HIP_THRESH and exercise_stage == "down": # Count on DOWN to UP
+                  current_stage = "up"
+                  rep_count += 1; session_stats[exercise_key]['reps'] = rep_count
+                  print(f"GM Count: {rep_count}"); say_feedback(str(rep_count)); reset_feedback_state()
+             # else: keep current_stage = exercise_stage
+
+             if knee_angle < STRAIGHT_KNEE_THRESH: say_feedback("Keep legs straighter", exercise_key)
+             if current_stage == 'down' and hip_angle > DOWN_HIP_THRESH + 10: say_feedback("Hinge lower", exercise_key)
+
+        # Removed High Knees Logic Block
+
+        # Crunches
+        elif exercise_key == "crunches":
+             hip_angle = calculate_angle(coords['left_shoulder'], coords['left_hip'], coords['left_knee'])
+             UP_HIP_THRESH, DOWN_HIP_THRESH = 95, 110
+
+             if hip_angle < UP_HIP_THRESH and exercise_stage != "up":
+                  current_stage = "up"
+             elif hip_angle > DOWN_HIP_THRESH and exercise_stage == "up": # Count on UP to DOWN
+                  current_stage = "down"
+                  rep_count += 1; session_stats[exercise_key]['reps'] = rep_count
+                  print(f"Crunch Count: {rep_count}"); say_feedback(str(rep_count)); reset_feedback_state()
+             # else: keep current_stage = exercise_stage
+
+             if current_stage == 'up' and hip_angle > UP_HIP_THRESH + 5: say_feedback("Lift higher", exercise_key)
+
+        # Jacks (Jumping Jacks)
+        elif exercise_key == "jacks":
+            shoulder_width = abs(coords['left_shoulder'][0] - coords['right_shoulder'][0])
+            hip_width = abs(coords['left_hip'][0] - coords['right_hip'][0])
+            base_width = shoulder_width if shoulder_width > 20 else hip_width
+            if base_width < 10: base_width = 50
+            leg_distance = abs(coords['left_ankle'][0] - coords['right_ankle'][0])
+            arms_raised = coords['left_wrist'][1] < coords['left_shoulder'][1] + 40 and coords['right_wrist'][1] < coords['right_shoulder'][1] + 40
+            LEGS_WIDE_THRESH, LEGS_NARROW_THRESH = base_width * 1.3, base_width * 1.6
+
+            if arms_raised and leg_distance > LEGS_WIDE_THRESH and exercise_stage != "up":
+                current_stage = "up"
+            elif not arms_raised and leg_distance < LEGS_NARROW_THRESH and exercise_stage == "up": # Count on UP to DOWN
+                current_stage = "down"
+                rep_count += 1; session_stats[exercise_key]['reps'] = rep_count
+                print(f"Jack Count: {rep_count}"); say_feedback(str(rep_count)); reset_feedback_state()
+            # else: keep current_stage = exercise_stage
+
+            if current_stage == 'up':
+                if not arms_raised: say_feedback("Arms higher", exercise_key)
+                if leg_distance < LEGS_WIDE_THRESH: say_feedback("Legs wider", exercise_key)
+            elif current_stage == 'down':
+                 if arms_raised and (coords['left_wrist'][1] < coords['left_shoulder'][1] - 50 or coords['right_wrist'][1] < coords['right_shoulder'][1] - 50): say_feedback("Arms down", exercise_key)
+                 if leg_distance > LEGS_NARROW_THRESH: say_feedback("Feet together", exercise_key)
+
+        # Default for unhandled exercises
+        else:
+            current_stage = "N/A"
+
+        # Update global stage only if it changed or was N/A initially
+        if current_stage != "N/A":
+             exercise_stage = current_stage
+        return rep_count, current_stage
+
+    except Exception as e:
+        print(f"Error in process_exercise for {exercise_key}: {e}")
+        exercise_stage = "start" # Reset on error
+        return rep_count, "Error"
 
 
 # --- Report Generation ---
 
 def generate_report():
-    """Generates a final session report image."""
-    # Create a 1080p image
+    """Generates a final session report image as a table."""
     report_img = np.full((1080, 1920, 3), (255, 255, 255), dtype=np.uint8)
     y_pos = 100
-    line_height = 50
     left_margin = 100
+    img_width = 1920
+    col_exercise_x = left_margin
+    col_reps_x = 550 # Adjusted column start
+    col_tip_x = 800  # Adjusted column start
+    col_tip_width = img_width - col_tip_x - left_margin # Width for tip text wrapping
+    row_height = 60 # Default row height
+    header_font_scale = 1.2
+    body_font_scale = 1.0
+    tip_font_scale = 0.9
+    header_color = (0, 0, 0)
+    line_color = (200, 200, 200)
+    tip_color = (0, 0, 180)
+    perfect_color = (0, 180, 0)
 
-    def put_text(text, y, size=1.0, color=(0, 0, 0), bold=False):
+    def put_text_multiline(text, x, y, size=1.0, color=(0, 0, 0), bold=False, max_width=None):
+        """Draws text, wrapping if max_width is specified. Returns total height used."""
         thickness = 3 if bold else 2
-        cv2.putText(report_img, text, (left_margin, y), cv2.FONT_HERSHEY_SIMPLEX, size, color, thickness, cv2.LINE_AA)
+        text_str = str(text) if text is not None else ""
+        lines = []
+        if max_width:
+             # Estimate average char width (very rough)
+             avg_char_width = int(size * 20) # Adjust multiplier
+             wrap_width_chars = max(10, max_width // avg_char_width) if avg_char_width > 0 else 10
+             wrapped = textwrap.wrap(text_str, width=wrap_width_chars)
+             lines.extend(wrapped)
+        else:
+            lines.append(text_str)
 
-    def draw_line(y):
-        cv2.line(report_img, (left_margin, y), (1920 - left_margin, y), (200, 200, 200), 2)
+        line_y = y
+        total_height = 0
+        line_spacing = int(size * 40) # Adjust multiplier as needed
+        for line in lines:
+             if line.strip():
+                 cv2.putText(report_img, line, (x, line_y), cv2.FONT_HERSHEY_SIMPLEX, size, color, thickness, cv2.LINE_AA)
+                 line_y += line_spacing
+                 total_height += line_spacing
+        return total_height if total_height > 0 else line_spacing # Return at least one line height
 
-    put_text("AI Physiotherapist - Session Report", y_pos, 2.5, (0, 165, 255), bold=True)
-    y_pos += 80
-    draw_line(y_pos)
-    y_pos += 80
 
+    def draw_line(y1, y2, x): # Vertical line
+        cv2.line(report_img, (x, y1), (x, y2), line_color, 2)
+
+    def draw_hline(y, x1=left_margin, x2=img_width - left_margin): # Horizontal line
+        cv2.line(report_img, (x1, y), (x2, y), line_color, 2)
+
+    # Report Title
+    put_text_multiline("AI Physiotherapist - Session Report", left_margin, y_pos, 2.0, (0, 165, 255), bold=True)
+    y_pos += 60
+    draw_hline(y_pos)
+    y_pos += row_height // 2 # Space before header
+
+    # Table Header
+    header_y = y_pos + int(header_font_scale * 30) # Vertical center alignment
+    put_text_multiline("Exercise", col_exercise_x, header_y, header_font_scale, header_color, bold=True)
+    put_text_multiline("Reps", col_reps_x, header_y, header_font_scale, header_color, bold=True)
+    put_text_multiline("Top Tip", col_tip_x, header_y, header_font_scale, header_color, bold=True)
+    y_pos += row_height
+    draw_hline(y_pos)
+    table_start_y = y_pos # Remember where table body starts for vertical lines
+
+    # Table Body
     total_reps = 0
-    exercises_done = 0
-    for exercise, data in session_stats.items():
-        if data["reps"] > 0:
-            exercises_done +=1
-            total_reps += data["reps"]
-            put_text(f"Exercise: {exercise.upper()}", y_pos, 1.5, bold=True)
-            y_pos += line_height + 20
-            put_text(f"Total Reps: {data['reps']}", y_pos, 1.2)
-            y_pos += line_height
+    max_rows_on_screen = 10 # Limit rows to prevent going off screen
+    rows_drawn = 0
 
+    for exercise, data in session_stats.items():
+        if data["reps"] > 0 and y_pos < (1080 - 100): # Check if there's vertical space
+            rows_drawn += 1
+            total_reps += data["reps"]
+
+            # Calculate the starting Y position for this row's content (top align)
+            content_start_y = y_pos + 20
+
+            # --- Draw Row Content ---
+            ex_height = put_text_multiline(exercise.upper(), col_exercise_x, content_start_y, body_font_scale, header_color)
+            rep_height = put_text_multiline(str(data['reps']), col_reps_x, content_start_y, body_font_scale, header_color)
+
+            # Top Tip (with wrapping)
+            tip_text = "N/A"
+            color = header_color
             if data["feedback"]:
                 try:
-                    feedback_counts = Counter(data["feedback"])
-                    most_common_tip = feedback_counts.most_common(1)[0]
-                    tip_text = f"'{most_common_tip[0]}' (repeated {most_common_tip[1]} times)"
-
-                    put_text("Your Top Tip:", y_pos, 1.2)
-                    y_pos += line_height
-                    put_text(tip_text, y_pos, 1.1, (0, 0, 180)) # Red text for tips
-                except IndexError: # Handle case where feedback list might be empty unexpectedly
-                     put_text("Top Tip: No specific feedback recorded.", y_pos + line_height, 1.1, (100, 100, 100))
-
+                    counts = Counter(data["feedback"])
+                    if counts:
+                        tip, count = counts.most_common(1)[0]
+                        tip_text = f"'{tip}' ({count} times)"
+                        color = tip_color
+                    else:
+                        tip_text = "No specific feedback."
+                        color = (100, 100, 100)
+                except IndexError:
+                    tip_text = "Error retrieving tip."
+                    color = (100, 100, 100)
             else:
-                put_text("Your Top Tip: Perfect form! No feedback given.", y_pos, 1.1, (0, 180, 0)) # Green text for good form
+                tip_text = "Perfect form!"
+                color = perfect_color
 
-            y_pos += 100
-            # Add line only if there's more space and more exercises
-            if y_pos < 900 and exercises_done < sum(1 for d in session_stats.values() if d["reps"] > 0):
-                draw_line(y_pos - 30)
-            elif y_pos >= 900:
-                 break # Stop adding exercises if report is full
+            tip_block_height = put_text_multiline(tip_text, col_tip_x, content_start_y, tip_font_scale, color, max_width=col_tip_width)
+
+            # --- Calculate Row Height and Draw Bottom Line ---
+            # Determine max height needed for this row
+            actual_row_height = max(row_height, ex_height, rep_height, tip_block_height) + 20 # Add padding
+            y_pos += actual_row_height # Move y_pos to the bottom of the current row
+            if y_pos < (1080 - 80): # Don't draw line too close to bottom
+                 draw_hline(y_pos) # Draw the line at the bottom
+            else:
+                 # Indicate truncation if we ran out of space
+                 if sum(1 for d in session_stats.values() if d["reps"] > 0) > rows_drawn:
+                      put_text_multiline("...", left_margin, y_pos - 10, 1.0, (100,100,100))
+                 break # Stop drawing rows
 
 
-    if total_reps == 0:
-        put_text("No exercises were completed in this session.", y_pos, 1.2)
-        y_pos += 60
+    table_end_y = y_pos # Remember where table body ends
 
-    put_text("Press 'q' to close this report.", (report_img.shape[0] - 60), 1.0, (100, 100, 100))
+    # Draw Vertical Lines for the table (adjust end Y position)
+    draw_line(table_start_y, table_end_y, col_reps_x - 30) # Between Ex and Reps
+    draw_line(table_start_y, table_end_y, col_tip_x - 30)  # Between Reps and Tip
+
+    if rows_drawn == 0:
+        put_text_multiline("No exercises were completed.", left_margin, y_pos + row_height, 1.2)
+        y_pos += row_height * 2
+
+
+    put_text_multiline("Press 'q' to close this report.", left_margin, 1080 - 60, 1.0, (100, 100, 100))
     return report_img
+
 
 # --- Main Application Loop ---
 
 def main():
-    global current_exercise, exercise_active
+    global current_exercise, exercise_active, exercise_stage
 
     # --- CAMERA SELECTION ---
-    # Try 1, 0, 2 in order
-    cap = cv2.VideoCapture(1)
+    camera_index = 0 # Default back to 0
+    cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
-        print("Warning: Could not open camera at index 1. Trying index 0.")
-        cap = cv2.VideoCapture(0)
+        print(f"Warning: Could not open camera at index {camera_index}. Trying index 1.")
+        camera_index = 1
+        cap = cv2.VideoCapture(camera_index)
         if not cap.isOpened():
-            print("Error: Could not open webcam at index 0 or 1. Please check camera.")
-            return
+             print(f"Error: Could not open webcam at index 0 or 1.")
+             return
 
-    print("AI Physiotherapist starting...")
+    print(f"AI Physiotherapist starting using camera index {camera_index}...")
 
     window_name = 'AI Physiotherapist'
     cv2.namedWindow(window_name, cv2.WND_PROP_FULLSCREEN)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    # --- Initial Pose Suggestion ---
-    suggestion_made = False
-    suggestion_start_time = time.time()
+    # Reset stage when starting
+    exercise_stage = "start"
+    say_feedback(f"Welcome to your AI Gym. Starting with {current_exercise}. Check controls.", None, force_say=True)
 
-    while cap.isOpened() and not suggestion_made:
-        ret, frame = cap.read()
-        if not ret:
-            print("Error: Camera frame empty during initial check.")
-            time.sleep(1) # Wait a bit before retrying or exiting
-            if time.time() - suggestion_start_time > 10: # Timeout after 10s
-                 print("Exiting due to persistent camera read error.")
-                 cap.release()
-                 cv2.destroyAllWindows()
-                 return
-            continue
-
-        frame = cv2.flip(frame, 1) # Flip horizontally
-
-        # Quick inference for pose check
-        img = cv2.resize(frame, (192, 192))
-        input_image = tf.expand_dims(tf.cast(img, dtype=tf.int32), axis=0)
-        try:
-            results = movenet(input_image); keypoints = results['output_0'].numpy()
-            landmarks = np.squeeze(keypoints)
-            # Check confidence before suggesting
-            if np.mean(landmarks[:, 2]) > 0.3:
-                initial_pose = analyze_initial_pose(landmarks)
-                suggest_exercises(initial_pose)
-                suggestion_made = True
-                time.sleep(4) # Give user time to hear suggestion
-            else:
-                 # Display "Detecting..." message
-                 h, w, _ = frame.shape
-                 text = "Detecting User..."
-                 (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
-                 cv2.putText(frame, text, ((w-tw)//2, (h+th)//2), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-                 cv2.imshow(window_name, frame)
-                 if cv2.waitKey(10) & 0xFF == ord('q'): # Allow quitting during detection
-                      cap.release()
-                      cv2.destroyAllWindows()
-                      return
-
-
-        except Exception as e:
-            print(f"Warning: Initial inference failed. {e}")
-            time.sleep(0.5) # Wait before retrying
-
-
-        # Exit if it takes too long to detect someone
-        if time.time() - suggestion_start_time > 15 and not suggestion_made:
-             print("No user detected after 15 seconds. Starting with default.")
-             say_feedback(f"Welcome. Starting with {current_exercise}. Check controls.", None, force_say=True)
-             suggestion_made = True # Proceed anyway
-             time.sleep(2)
-
-
-    print("Starting main exercise loop. Check UI for controls. Press 'q' to quit.")
-
+    frame_count = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
-        if not ret:
-            print("Error: Camera frame is empty during main loop. Exiting.")
-            break # Exit loop if camera fails
-        frame = cv2.flip(frame, 1)
+        if not ret: print("Error: Camera frame empty."); time.sleep(1); break
+        frame = cv2.flip(frame, 1) # Mirror effect
+
+        # --- Resize for Inference ---
+        input_size = 192 # MoveNet Lightning input size
+        h, w, _ = frame.shape
+        if h == 0 or w == 0: continue
+        # Maintain aspect ratio by padding
+        if h > w: pad = (h - w) // 2; input_frame = cv2.copyMakeBorder(frame, 0, 0, pad, pad, cv2.BORDER_CONSTANT)
+        elif w > h: pad = (w - h) // 2; input_frame = cv2.copyMakeBorder(frame, pad, pad, 0, 0, cv2.BORDER_CONSTANT)
+        else: input_frame = frame
+        try:
+             img_resized = cv2.resize(input_frame, (input_size, input_size), interpolation=cv2.INTER_LINEAR)
+        except cv2.error as e: print(f"Resize error: {e}"); continue
+        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB) # Model expects RGB
 
         # --- Model Inference ---
-        img = cv2.resize(frame, (192, 192))
-        input_image = tf.expand_dims(tf.cast(img, dtype=tf.int32), axis=0)
+        input_tensor = tf.cast(tf.expand_dims(img_rgb, axis=0), dtype=tf.int32)
+        keypoints_with_scores = None
         try:
-            results = movenet(input_image); keypoints = results['output_0'].numpy()
-        except Exception as e:
-            print(f"Warning: Model inference failed. Skipping frame. {e}")
-            continue # Skip frame on error
+            results = movenet(input_tensor)
+            # Output is shape (1, 1, 17, 3) [batch, instance, keypoint, (y, x, score)]
+            keypoints_with_scores = results['output_0'].numpy()
+        except Exception as e: print(f"Inference error: {e}"); exercise_active = False; landmarks = None
 
-        landmarks = np.squeeze(keypoints)
-        # Check overall confidence, more robustly
-        visible_keypoints = landmarks[landmarks[:, 2] > 0.3]
-        exercise_active = len(visible_keypoints) >= 10 # Require at least 10 visible keypoints
+        # --- Landmark Processing & Activity Check ---
+        landmarks = None # Use this for processing functions
+        if keypoints_with_scores is not None and keypoints_with_scores.shape == (1, 1, 17, 3):
+            landmarks = np.squeeze(keypoints_with_scores) # Shape (17, 3)
+            conf_scores = landmarks[:, 2]
+            visible_scores = conf_scores[conf_scores > VISIBILITY_THRESHOLD]
+            avg_confidence = np.mean(visible_scores) if len(visible_scores) > 0 else 0
+            # Activity check: Need at least a few points with reasonable confidence
+            exercise_active = len(visible_scores) >= 5 and avg_confidence > 0.25
+        else:
+            exercise_active = False
 
+        # --- Get Current State ---
+        rep_count = session_stats.get(current_exercise, {}).get('reps', 0)
+        # Use the global exercise_stage, default to "start" if not set
+        current_stage_display = exercise_stage if exercise_stage else "start"
 
-        rep_count, stage = 0, ""
-
-        # Process exercise logic only if active
-        if exercise_active:
-            try:
-                # Dynamically call the correct process_ function based on current_exercise
-                process_func_name = f"process_{current_exercise}"
-                if process_func_name in globals():
-                    process_func = globals()[process_func_name]
-                    rep_count, stage = process_func(landmarks, frame.shape)
-                else:
-                    print(f"Warning: No processing function named {process_func_name} found.")
-                    stage = "N/A" # Indicate exercise cannot be processed
-            except Exception as e:
-                 # print(f"Error in processing {current_exercise}: {e}") # Optional: for debugging
-                 # Don't reset stage here, let it persist or be N/A
-                 pass # Silently ignore errors during processing, keep last known stage/rep
-                 rep_count = session_stats[current_exercise]['reps'] # Keep last rep count
-                 stage = globals().get(f"{current_exercise}_stage", "Error") # Keep last stage or show Error
+        # --- Process Exercise Logic ---
+        if landmarks is not None and exercise_active:
+            # Call the unified processing function
+            new_rep_count, new_stage = process_exercise(landmarks, frame.shape, current_exercise)
+            # Update display variables if processing was successful
+            if new_stage != "Error": # Check for processing error
+                 rep_count = new_rep_count
+                 current_stage_display = new_stage if new_stage != "N/A" else "N/A" # Show N/A if visibility failed
+            else:
+                 current_stage_display = "Error" # Show error on UI if processing failed
+        elif not exercise_active:
+             current_stage_display = "---" # Show inactive state
 
         # --- Draw Visuals ---
-        # Draw skeleton only if active to avoid drawing on empty frames
-        if exercise_active:
-            draw_keypoints_and_skeleton(frame, keypoints, 0.3) # Lower threshold slightly
-        # Always draw UI
-        draw_ui(frame, rep_count, stage, current_exercise)
+        if landmarks is not None and exercise_active:
+            # Pass the original keypoints_with_scores for drawing
+            draw_keypoints_and_skeleton(frame, keypoints_with_scores, VISIBILITY_THRESHOLD)
+
+            # --- VISUAL DEBUGGING (Example for Lateral Raises - Shoulder Angle) ---
+            if current_exercise == "raises":
+                try:
+                    ls_coord, ls_conf = get_landmark_px(landmarks, 'left_shoulder', frame_shape)
+                    le_coord, le_conf = get_landmark_px(landmarks, 'left_elbow', frame_shape)
+                    lh_coord, lh_conf = get_landmark_px(landmarks, 'left_hip', frame_shape)
+                    rs_coord, rs_conf = get_landmark_px(landmarks, 'right_shoulder', frame_shape)
+                    re_coord, re_conf = get_landmark_px(landmarks, 'right_elbow', frame_shape)
+                    rh_coord, rh_conf = get_landmark_px(landmarks, 'right_hip', frame_shape)
+
+                    # Draw Left Shoulder Angle
+                    if min(ls_conf, le_conf, lh_conf) > 0.1:
+                        l_sh_angle = calculate_angle(lh_coord, ls_coord, le_coord)
+                        cv2.putText(frame, f"LSh:{l_sh_angle:.0f}", (int(ls_coord[0]-50), int(ls_coord[1]-10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2) # Cyan
+                    # Draw Right Shoulder Angle
+                    if min(rs_conf, re_conf, rh_conf) > 0.1:
+                        r_sh_angle = calculate_angle(rh_coord, rs_coord, re_coord)
+                        cv2.putText(frame, f"RSh:{r_sh_angle:.0f}", (int(rs_coord[0]+10), int(rs_coord[1]-10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2) # Cyan
+                except Exception: pass # Ignore drawing errors
+
+
+        draw_ui(frame, rep_count, current_stage_display, current_exercise)
         cv2.imshow(window_name, frame)
 
         # --- Key Controls ---
         key = cv2.waitKey(10) & 0xFF
-        def switch_exercise(ex_name, ex_speech):
-            global current_exercise, last_feedback_message
-            # Reset stage for the *old* exercise before switching
-            globals()[f"{current_exercise}_stage"] = "up" if current_exercise in ["squats", "pushups", "lunges", "press", "goodmornings", "crunches"] else "down"
-
-            if current_exercise != ex_name:
-                current_exercise = ex_name
-                reset_feedback_state() # Reset feedback when switching
-                say_feedback(ex_speech, None, force_say=True) # Force say new exercise name
+        def switch_exercise(ex_key, ex_speech):
+            global current_exercise, exercise_stage, last_feedback_message
+            if current_exercise != ex_key:
+                print(f"Switching to {ex_key}")
+                current_exercise = ex_key
+                exercise_stage = "start" # Reset stage on switch
+                reset_feedback_state()
+                say_feedback(ex_speech, None, force_say=True)
 
         if key == ord('q'): say_feedback("Workout complete. Generating report.", None, force_say=True); time.sleep(2); break
         elif key == ord('s'): switch_exercise("squats", "Squats")
         elif key == ord('c'): switch_exercise("curls", "Bicep Curls. Left arm.")
         elif key == ord('j'): switch_exercise("jacks", "Jumping Jacks")
-        elif key == ord('p'): switch_exercise("pushups", "Pushups. Side view.")
+        elif key == ord('p'): switch_exercise("pushups", "Pushups. Side view recommended.")
         elif key == ord('l'): switch_exercise("lunges", "Lunges. Left leg forward.")
         elif key == ord('o'): switch_exercise("press", "Overhead Press")
         elif key == ord('r'): switch_exercise("raises", "Lateral Raises")
-        elif key == ord('g'): switch_exercise("goodmornings", "Good Mornings. Side view.")
-        elif key == ord('h'): switch_exercise("highknees", "High Knees")
-        elif key == ord('n'): switch_exercise("crunches", "Crunches. Side view.")
+        elif key == ord('g'): switch_exercise("goodmornings", "Good Mornings. Side view recommended.")
+        # Removed High Knees key bind
+        elif key == ord('n'): switch_exercise("crunches", "Crunches. Side view recommended.")
+
+        frame_count += 1
 
     # --- Cleanup and Report ---
-    if cap.isOpened():
-        cap.release()
+    if cap.isOpened(): cap.release()
     cv2.destroyAllWindows()
 
     # --- Display Final Report ---
     print("\n--- SESSION REPORT ---")
-    total_reps_all = 0
+    total_reps_all = sum(data["reps"] for data in session_stats.values())
     for ex, data in session_stats.items():
         if data["reps"] > 0:
-            total_reps_all += data["reps"]
             print(f"\n{ex.upper()}: Reps: {data['reps']}")
             if data["feedback"]:
-                try:
-                    counts = Counter(data["feedback"]); tip, count = counts.most_common(1)[0]
-                    print(f"  Top Tip: '{tip}' ({count} times)")
-                except IndexError:
-                    print("  Top Tip: No specific feedback recorded.")
+                try: counts = Counter(data["feedback"]); tip, count = counts.most_common(1)[0]; print(f"  Top Tip: '{tip}' ({count} times)")
+                except IndexError: print("  Top Tip: No specific feedback recorded.")
             else: print("  Top Tip: Perfect form!")
     if total_reps_all == 0: print("No exercises completed.")
     print("\nClose report window to exit.")
 
-    # Generate and display report only if some reps were done or if forced (e.g., debug)
-    if total_reps_all >= 0: # Show report even if 0 reps
-        try:
-            report_image = generate_report()
-            report_window = 'Session Report'; cv2.namedWindow(report_window, cv2.WND_PROP_FULLSCREEN)
-            cv2.setWindowProperty(report_window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-            cv2.imshow(report_window, report_image)
-            while cv2.waitKey(10) & 0xFF != ord('q'): pass
-            cv2.destroyAllWindows()
-        except Exception as e:
-            print(f"Error displaying final report: {e}")
-            cv2.destroyAllWindows() # Ensure all windows close on error
+    try:
+        report_image = generate_report()
+        report_window = 'Session Report'; cv2.namedWindow(report_window, cv2.WND_PROP_FULLSCREEN)
+        cv2.setWindowProperty(report_window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        cv2.imshow(report_window, report_image)
+        while True:
+            if cv2.getWindowProperty(report_window, cv2.WND_PROP_VISIBLE) < 1: break
+            if cv2.waitKey(100) & 0xFF == ord('q'): break
+        cv2.destroyAllWindows()
+    except Exception as e: print(f"Error displaying final report: {e}"); cv2.destroyAllWindows()
 
 if __name__ == '__main__':
-    main()
+    try: main()
+    except Exception as e:
+        print(f"\n--- An unexpected error occurred in main ---"); print(f"Error: {e}")
+        import traceback; traceback.print_exc()
+    finally:
+        # TTS Cleanup
+        if 'engine' in globals() and engine is not None:
+             try:
+                 is_busy = getattr(engine, 'isBusy', lambda: False)()
+                 if is_busy: engine.stop()
+                 if getattr(engine, '_inLoop', False): engine.endLoop()
+             except Exception: pass # Ignore cleanup errors
+        cv2.destroyAllWindows(); print("\nApplication finished.")
 
